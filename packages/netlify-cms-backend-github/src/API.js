@@ -137,9 +137,7 @@ export default class API {
 
   generateContentKey(collectionName, slug) {
     if (!this.useOpenAuthoring) {
-      // this doesn't use the collection, but we need to leave it that way for backwards
-      // compatibility
-      return slug;
+      return `${collectionName}/${slug}`;
     }
 
     return `${this.repo}/${collectionName}/${slug}`;
@@ -343,8 +341,9 @@ export default class API {
     );
   }
 
-  readUnpublishedBranchFile(contentKey) {
-    const metaDataPromise = this.retrieveMetadata(contentKey).then(data =>
+  readUnpublishedBranchFile(collection, slug) {
+    const contentKey = this.generateContentKey(collection, slug);
+    const metaDataPromise = this.metaDataPromises(slug, contentKey).then(([data]) =>
       data.objects.entry.path ? data : Promise.reject(null),
     );
     const repoURL = this.useOpenAuthoring
@@ -406,6 +405,10 @@ export default class API {
     const prs = await this.getPRsForBranchName({ branchName, ...rest });
     return prs.some(pr => pr.head.ref === branchName);
   };
+
+  metaDataPromises(slug, contentKey) {
+    return onlySuccessfulPromises([this.retrieveMetadata(slug), this.retrieveMetadata(contentKey)]);
+  }
 
   getUpdatedOpenAuthoringMetadata = async (contentKey, { metadata: metadataArg } = {}) => {
     const metadata = metadataArg || (await this.retrieveMetadata(contentKey)) || {};
@@ -598,12 +601,13 @@ export default class API {
   }
 
   async editorialWorkflowGit(fileTree, entry, filesList, options) {
-    const contentKey = this.generateContentKey(options.collectionName, entry.slug);
-    const branchName = this.generateBranchName(contentKey);
+    const slug = entry.slug;
+    let contentKey = this.generateContentKey(options.collectionName, entry.slug);
     const unpublished = options.unpublished || false;
     if (!unpublished) {
       // Open new editorial review workflow for this entry - Create new metadata and commit to new branch
       const userPromise = this.user();
+      const branchName = this.generateBranchName(contentKey);
       const branchData = await this.getBranch();
       const changeTree = await this.updateTree(branchData.commit.sha, '/', fileTree);
       const commitResponse = await this.commit(options.commitMessage, changeTree);
@@ -646,11 +650,15 @@ export default class API {
       });
     } else {
       // Entry is already on editorial review workflow - just update metadata and commit to existing branch
+      const metadataPromises = [this.retrieveMetadata(slug), this.retrieveMetadata(contentKey)];
+      const [oldMetadata, newMetadata] = await Promise.all(
+        metadataPromises.map(p => p.catch(() => false)),
+      );
+      const metadata = oldMetadata || newMetadata;
+      const branchName = metadata.branch;
       const branchData = await this.getBranch(branchName);
       const changeTree = await this.updateTree(branchData.commit.sha, '/', fileTree);
-      const commitPromise = this.commit(options.commitMessage, changeTree);
-      const metadataPromise = this.retrieveMetadata(contentKey);
-      const [commit, metadata] = await Promise.all([commitPromise, metadataPromise]);
+      const commit = await this.commit(options.commitMessage, changeTree);
       const { title, description } = options.parsedData || {};
       const metadataFiles = get(metadata.objects, 'files', []);
       const files = [...metadataFiles, ...filesList];
@@ -660,6 +668,8 @@ export default class API {
         files: uniq(files),
       };
       const updatedMetadata = { ...metadata, pr, title, description, objects };
+
+      oldMetadata && (contentKey = slug);
 
       if (options.hasAssetStore) {
         await this.storeMetadata(contentKey, updatedMetadata);
@@ -823,9 +833,13 @@ export default class API {
   }
 
   async updateUnpublishedEntryStatus(collectionName, slug, status) {
-    const contentKey = this.generateContentKey(collectionName, slug);
-    const metadata = await this.retrieveMetadata(contentKey);
-
+    let contentKey = this.generateContentKey(collectionName, slug);
+    const metadataPromises = [this.retrieveMetadata(slug), this.retrieveMetadata(contentKey)];
+    const [oldMetadata, newMetadata] = await Promise.all(
+      metadataPromises.map(p => p.catch(() => false)),
+    );
+    const metadata = oldMetadata || newMetadata;
+    oldMetadata && (contentKey = slug);
     if (!this.useOpenAuthoring) {
       return this.storeMetadata(contentKey, {
         ...metadata,
@@ -873,11 +887,10 @@ export default class API {
 
   async deleteUnpublishedEntry(collectionName, slug) {
     const contentKey = this.generateContentKey(collectionName, slug);
-    const branchName = this.generateBranchName(contentKey);
+    const [metadata] = await this.metaDataPromises(slug, contentKey);
     return (
-      this.retrieveMetadata(contentKey)
-        .then(metadata => (metadata && metadata.pr ? this.closePR(metadata.pr) : Promise.resolve()))
-        .then(() => this.deleteBranch(branchName))
+      (metadata && metadata.pr ? this.closePR(metadata.pr) : Promise.resolve())
+        .then(() => this.deleteBranch(metadata.branch))
         // If the PR doesn't exist, then this has already been deleted -
         // deletion should be idempotent, so we can consider this a
         // success.
@@ -891,12 +904,12 @@ export default class API {
     );
   }
 
-  publishUnpublishedEntry(collectionName, slug) {
+  async publishUnpublishedEntry(collectionName, slug) {
     const contentKey = this.generateContentKey(collectionName, slug);
-    const branchName = this.generateBranchName(contentKey);
-    return this.retrieveMetadata(contentKey)
-      .then(metadata => this.mergePR(metadata.pr, metadata.objects))
-      .then(() => this.deleteBranch(branchName));
+    const [metadata] = await this.metaDataPromises(slug, contentKey);
+    return this.mergePR(metadata.pr, metadata.objects).then(() =>
+      this.deleteBranch(metadata.branch),
+    );
   }
 
   createRef(type, name, sha) {
